@@ -1,7 +1,0 @@
-services:
-  - type: web
-    name: logout-clicker
-    env: docker
-    plan: starter
-    autoDeploy: true
-    healthCheckPath: /
