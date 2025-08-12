@@ -1,4 +1,4 @@
-// server.js — versão com logs step-by-step + pequenos fallbacks de confiabilidade
+// server.js — API-first + fallback Playwright, com logs step-by-step
 const express = require("express");
 const { chromium } = require("playwright");
 
@@ -9,28 +9,15 @@ app.use(express.json({ limit: "1mb" }));
 app.use(express.urlencoded({ extended: true }));
 
 // ---------- Config ----------
-const DEFAULT_BUTTON_CANDIDATES = [
-  /deslogar/i,
-  /sair de todos os dispositivos/i,
-  /logout all sessions/i,
-  /logout/i
-];
-
-const CHROME_ARGS = [
-  "--no-sandbox",
-  "--disable-setuid-sandbox",
-  "--disable-dev-shm-usage",
-  "--disable-gpu"
-];
+const CHROME_ARGS = ["--no-sandbox","--disable-setuid-sandbox","--disable-dev-shm-usage","--disable-gpu"];
+const DEFAULT_BUTTON_CANDIDATES = [/deslogar/i, /sair de todos os dispositivos/i, /logout all sessions/i, /logout/i];
+const IDEMP_TTL_MS = 10 * 60 * 1000; // 10min
+const seen = new Map(); // url -> timestamp
 
 // ---------- Utils ----------
-function now() { return new Date().toISOString(); }
-function log(step, data = {}) {
-  // logs simples e legíveis
-  console.log(JSON.stringify({ ts: now(), step, ...data }));
-}
+function ts() { return new Date().toISOString(); }
+function log(step, data = {}) { console.log(JSON.stringify({ ts: ts(), step, ...data })); }
 
-// Auth opcional via Bearer
 function checkAuth(req, res) {
   const expected = process.env.AUTH_TOKEN;
   if (!expected) return true;
@@ -51,10 +38,24 @@ function coerceUrl(req) {
   return u;
 }
 
+function extractAccessId(url) {
+  // pega o trecho depois de /logout/
+  const m = url.match(/sendflow\.pro\/logout\/([^/?#]+)/i);
+  return m ? m[1] : null;
+}
+
+function seenRecently(u) {
+  const now = Date.now();
+  for (const [k, t] of seen) if (now - t > IDEMP_TTL_MS) seen.delete(k);
+  const last = seen.get(u);
+  seen.set(u, now);
+  return last && (now - last < IDEMP_TTL_MS);
+}
+
+// ---------- Playwright helpers ----------
 async function clickFirstMatch(page, candidates, explicitSelector, timeoutMs = 5000) {
   log("click_start");
 
-  // 1) seletor explícito
   if (explicitSelector) {
     log("click_try_selector", { selector: explicitSelector });
     const el = page.locator(explicitSelector);
@@ -67,7 +68,6 @@ async function clickFirstMatch(page, candidates, explicitSelector, timeoutMs = 5
     }
   }
 
-  // 2) role=button + texto
   for (const rx of candidates) {
     log("click_try_role_text", { rx: rx.toString() });
     const btn = page.getByRole("button", { name: rx });
@@ -78,13 +78,10 @@ async function clickFirstMatch(page, candidates, explicitSelector, timeoutMs = 5
         await btn.first().click({ timeout: timeoutMs });
         log("click_ok_role_text", { rx: rx.toString() });
         return { clicked: true, how: "role+text", value: rx.toString() };
-      } catch (e) {
-        log("click_fail_role_text", { err: e.message });
-      }
+      } catch (e) { log("click_fail_role_text", { err: e.message }); }
     }
   }
 
-  // 3) fallback: qualquer texto clicável
   for (const rx of candidates) {
     log("click_try_text", { rx: rx.toString() });
     const t = page.getByText(rx, { exact: false });
@@ -95,13 +92,10 @@ async function clickFirstMatch(page, candidates, explicitSelector, timeoutMs = 5
         await t.first().click({ timeout: timeoutMs });
         log("click_ok_text", { rx: rx.toString() });
         return { clicked: true, how: "text", value: rx.toString() };
-      } catch (e) {
-        log("click_fail_text", { err: e.message });
-      }
+      } catch (e) { log("click_fail_text", { err: e.message }); }
     }
   }
 
-  // 4) fallback final: primeiro <button> visível
   try {
     log("click_try_first_visible_button");
     const firstBtn = page.locator("button:visible").first();
@@ -122,15 +116,12 @@ async function clickFirstMatch(page, candidates, explicitSelector, timeoutMs = 5
 
 // ---------- Routes ----------
 app.get("/", (_req, res) => {
-  res.type("text/plain").send("OK: use POST /logout { url, selector?, buttonText? }");
+  res.type("text/plain").send("OK: POST /logout { url, selector?, buttonText? }");
 });
 
 app.post("/logout", async (req, res) => {
   const t0 = Date.now();
-  log("req_received", {
-    hasAuth: !!req.get("authorization"),
-    ct: req.get("content-type") || null
-  });
+  log("req_received", { hasAuth: !!req.get("authorization"), ct: req.get("content-type") || null });
   log("req_body", { body: req.body });
 
   if (!checkAuth(req, res)) return;
@@ -142,9 +133,52 @@ app.post("/logout", async (req, res) => {
     return res.status(400).json({ ok: false, error: "Body deve conter { url: string http/https }" });
   }
 
+  // idempotência simples
+  if (seenRecently(url)) {
+    log("skip_idempotent", { url });
+    return res.json({ ok: true, skipped: true, reason: "recently processed", finalUrl: "https://sendflow.pro/login" });
+  }
+
+  const accessId = extractAccessId(url);
+  log("access_id", { accessId });
+
+  // 1) Tenta API direta primeiro
+  if (accessId) {
+    try {
+      const apiUrl = `https://southamerica-east1-whatsapp-ultimate.cloudfunctions.net/api/users/logout/${accessId}`;
+      log("api_call_start", { apiUrl });
+      const r = await fetch(apiUrl, {
+        method: "GET",
+        headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) HeadlessLogout/1.0" }
+      });
+      const status = r.status;
+      let body = null;
+      try { body = await r.text(); } catch {}
+      log("api_call_done", { status, body: body?.slice?.(0, 200) || null });
+
+      if (status >= 200 && status < 400) {
+        log("api_success");
+        const total = Date.now() - t0;
+        log("done_api_only", { totalMs: total });
+        return res.json({
+          ok: true,
+          via: "api",
+          apiStatus: status,
+          finalUrl: "https://sendflow.pro/login"
+        });
+      }
+      log("api_non_2xx", { status });
+    } catch (e) {
+      log("api_call_error", { err: e.message });
+    }
+  } else {
+    log("no_access_id_in_url");
+  }
+
+  // 2) Fallback: Playwright (UI)
   const selector = req.body?.selector || null;
   const buttonText = req.body?.buttonText || "Deslogar";
-  log("inputs", { selector, buttonText });
+  log("fallback_ui_start", { selector, buttonText });
 
   let browser, ctx, page;
   const logoutHits = [];
@@ -157,13 +191,11 @@ app.post("/logout", async (req, res) => {
     // Context
     log("context_creating");
     ctx = await browser.newContext({
-      userAgent:
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119 Safari/537.36",
+      userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119 Safari/537.36",
       viewport: { width: 1366, height: 768 }
     });
     log("context_created");
 
-    // Bloqueia recursos pesados (mantém XHR/JS)
     await ctx.route("**/*", (route) => {
       const t = route.request().resourceType();
       if (t === "image" || t === "font" || t === "media") return route.abort();
@@ -171,7 +203,6 @@ app.post("/logout", async (req, res) => {
     });
     log("route_blockers_set");
 
-    // Observa rede para detectar logout/signout/sessions
     ctx.on("request", (r) => {
       const u = r.url();
       if (/logout|signout|sessions/i.test(u)) log("net_req", { method: r.method(), url: u });
@@ -185,24 +216,20 @@ app.post("/logout", async (req, res) => {
       }
     });
 
-    // Page
     page = await ctx.newPage();
     page.setDefaultTimeout(6000);
     page.setDefaultNavigationTimeout(12000);
     page.on("console", (m) => log("page_console", { type: m.type(), text: m.text() }));
 
-    // Navega (onload)
     log("goto_start", { url });
     await page.goto(url, { waitUntil: "load", timeout: 15000 });
     log("goto_done", { title: await page.title().catch(() => null), currentUrl: page.url() });
 
-    // Clique
     const candidates = [new RegExp(buttonText, "i"), ...DEFAULT_BUTTON_CANDIDATES];
     log("click_attempt");
     let clickResult = await clickFirstMatch(page, candidates, selector, 5000);
     log("click_result", clickResult);
 
-    // Espera resultado do clique (rede ou load/URL)
     if (clickResult.clicked) {
       log("post_click_wait_start");
       await Promise.race([
@@ -219,24 +246,7 @@ app.post("/logout", async (req, res) => {
       log("post_click_wait_done", { logoutHits: logoutHits.length });
     }
 
-    // Fallback 1: segundo clique se nada foi detectado
-    if (clickResult.clicked && logoutHits.length === 0 && /\/logout\//i.test(page.url())) {
-      try {
-        log("fallback_second_click");
-        const btn = page.getByRole("button", { name: /deslogar/i });
-        if (await btn.count()) {
-          await btn.first().click({ timeout: 3000 });
-          await page.waitForLoadState("load", { timeout: 4000 }).catch(() => {});
-          log("fallback_second_click_ok");
-        } else {
-          log("fallback_second_click_no_button");
-        }
-      } catch (e) {
-        log("fallback_second_click_fail", { err: e.message });
-      }
-    }
-
-    // Fallback 2: forçar navegação para /login (idempotente)
+    // força /login como acabamento
     if (/sendflow\.pro\/logout\//i.test(page.url())) {
       try {
         log("force_login_nav");
@@ -250,7 +260,6 @@ app.post("/logout", async (req, res) => {
       }
     }
 
-    // Final
     const title = await page.title().catch(() => null);
     const finalUrl = page.url();
     log("final_state", { title, finalUrl, logoutHits: logoutHits.length });
@@ -261,14 +270,16 @@ app.post("/logout", async (req, res) => {
 
     return res.json({
       ok: true,
+      via: "ui",
       clicked: !!clickResult.clicked,
       clickHow: clickResult.how || null,
       clickValue: clickResult.value || null,
+      logoutRequests: logoutHits,
       pageTitle: title,
       finalUrl
     });
   } catch (err) {
-    log("error", { err: err?.message });
+    log("error_ui", { err: err?.message });
     try { if (ctx) await ctx.close(); } catch {}
     try { if (browser) await browser.close(); } catch {}
     return res.status(500).json({ ok: false, error: err?.message || String(err) });
@@ -279,6 +290,5 @@ app.post("/logout", async (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => log("listening", { port: PORT }));
 
-// ---------- Optional: logs de desligamento (Render hiberna/reinicia) ----------
 process.on("SIGTERM", () => { log("sigterm"); process.exit(0); });
 process.on("SIGINT", () => { log("sigint"); process.exit(0); });
